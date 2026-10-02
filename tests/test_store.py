@@ -163,6 +163,106 @@ class StoreTest(unittest.TestCase):
         with self.assertRaises(storage.CorruptLogError):
             self.open_store()
 
+    def test_clean_restart_then_append_then_restart_stays_consistent(self):
+        store = self.open_store()
+        first = [canonical.dumps_canonical({"batch": 1, "i": i}) for i in range(2)]
+        store.append_entries(first)
+        published_head = canonical.loads((self.path / "tree-head.json").read_bytes())
+
+        # A clean restart must observe the same persistent state without
+        # rewriting the published head or losing the committed byte offset.
+        reopened = self.open_store()
+        self.assertEqual(reopened.tree_size, 2)
+        self.assertEqual(reopened.log_bytes, (self.path / "log").stat().st_size)
+        self.assertEqual(
+            canonical.loads((self.path / "tree-head.json").read_bytes()),
+            published_head,
+        )
+
+        second = [canonical.dumps_canonical({"batch": 2, "i": i}) for i in range(3)]
+        start, _, _ = reopened.append_entries(second)
+        self.assertEqual(start, 2)
+
+        recovered = self.open_store()
+        self.assertEqual(recovered.tree_size, 5)
+        self.assertEqual(recovered.log_bytes, (self.path / "log").stat().st_size)
+        head = canonical.loads((self.path / "tree-head.json").read_bytes())
+        self.assertEqual(head["tree_size"], 5)
+        self.assertEqual(head["log_bytes"], recovered.log_bytes)
+        self.assertEqual(head["root_hash"], recovered.root.hex())
+        self.assertEqual(recovered.root, merkle.root_from_entries(first + second))
+
+        # Records, inclusion proofs, and consistency proofs all describe the
+        # same recovered state.
+        for index in range(5):
+            self.assertEqual(recovered.get_entry(index), (first + second)[index])
+            entry, size, root, proof = recovered.inclusion(index)
+            self.assertTrue(
+                merkle.verify_inclusion(
+                    leaf_data=entry,
+                    leaf_index=index,
+                    tree_size=size,
+                    proof=proof,
+                    expected_root=root,
+                )
+            )
+        old_root, new_size, new_root, proof = recovered.consistency(2)
+        self.assertEqual(old_root, merkle.root_from_entries(first))
+        self.assertTrue(
+            merkle.verify_consistency(
+                old_size=2,
+                new_size=new_size,
+                old_root=old_root,
+                new_root=new_root,
+                proof=proof,
+            )
+        )
+
+    def test_unpublished_tail_records_and_torn_frame_recover_together(self):
+        store = self.open_store()
+        published = [canonical.dumps_canonical({"n": i}) for i in range(2)]
+        store.append_entries(published)
+        unpublished = [canonical.dumps_canonical({"n": i}) for i in range(2, 4)]
+
+        log = self.path / "log"
+        with open(log, "ab") as handle:
+            for payload in unpublished:
+                handle.write(storage.build_frame(payload))
+            handle.flush()
+            os.fsync(handle.fileno())
+        with open(log, "ab") as handle:
+            handle.write(b"VLOG" + (50).to_bytes(8, "big") + b'{"n":')
+
+        recovered = self.open_store()
+        self.assertEqual(recovered.tree_size, 4)
+        self.assertEqual(recovered.log_bytes, log.stat().st_size)
+        head = canonical.loads((self.path / "tree-head.json").read_bytes())
+        self.assertEqual(head["tree_size"], 4)
+        self.assertEqual(head["log_bytes"], recovered.log_bytes)
+        self.assertEqual(recovered.root, merkle.root_from_entries(published + unpublished))
+
+        # The republished state must survive another restart unchanged.
+        again = self.open_store()
+        self.assertEqual(again.tree_size, 4)
+        self.assertEqual(again.log_bytes, recovered.log_bytes)
+        self.assertEqual(again.root, recovered.root)
+
+    def test_committed_corruption_with_torn_tail_is_fatal_and_untouched(self):
+        store = self.open_store()
+        store.append_entries([canonical.dumps_canonical({"i": i}) for i in range(3)])
+
+        log = self.path / "log"
+        data = bytearray(log.read_bytes())
+        data[20] ^= 0x01
+        data += b"VLOG" + (10).to_bytes(8, "big") + b"{pa"
+        log.write_bytes(data)
+
+        with self.assertRaises(storage.CorruptLogError):
+            self.open_store()
+        # Fatal corruption must not be "repaired" by truncating the tail:
+        # the on-disk bytes stay exactly as they were found.
+        self.assertEqual(log.read_bytes(), bytes(data))
+
 
 if __name__ == "__main__":
     unittest.main()

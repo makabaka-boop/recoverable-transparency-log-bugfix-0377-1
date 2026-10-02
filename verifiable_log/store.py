@@ -198,6 +198,7 @@ class Store:
 
         truncated = False
         truncate_end = 0
+        complete_end = 0
         file_size = 0
         with open(self.log_path, "rb") as handle:
             file_size = handle.seek(0, os.SEEK_END)
@@ -206,7 +207,6 @@ class Store:
                 raise CorruptLogError("committed log offset is beyond end of file")
 
             while handle.tell() < committed_bytes:
-                start = handle.tell()
                 payload, frame_start, incomplete = self._read_frame(
                     handle, committed=True
                 )
@@ -234,7 +234,6 @@ class Store:
                 raise CorruptLogError("committed root hash does not match log records")
 
             while True:
-                start = handle.tell()
                 payload, frame_start, incomplete = self._read_frame(
                     handle, committed=False
                 )
@@ -245,6 +244,10 @@ class Store:
                     break
                 entries.append(payload)
                 hashes.append(merkle.leaf_hash(payload))
+            # Offset just past the last physically complete frame.  With a
+            # torn tail this is where the partial frame begins; otherwise the
+            # scan stopped at a clean end of file.
+            complete_end = truncate_end if truncated else handle.tell()
 
         if truncated:
             with open(self.log_path, "r+b") as truncate_handle:
@@ -255,7 +258,7 @@ class Store:
 
         size = len(entries)
         root = merkle.root_hash(hashes)
-        effective_end = truncate_end
+        effective_end = complete_end
         self.entries = entries
         self.hashes = hashes
         self.tree_size = size
