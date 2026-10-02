@@ -199,6 +199,7 @@ class Store:
         truncated = False
         truncate_end = 0
         file_size = 0
+        valid_end = 0
         with open(self.log_path, "rb") as handle:
             file_size = handle.seek(0, os.SEEK_END)
             handle.seek(0)
@@ -242,9 +243,13 @@ class Store:
                     if incomplete:
                         truncate_end = frame_start
                         truncated = True
+                    else:
+                        # A clean frame boundary: durable bytes extend to here.
+                        valid_end = start
                     break
                 entries.append(payload)
                 hashes.append(merkle.leaf_hash(payload))
+                valid_end = handle.tell()
 
         if truncated:
             with open(self.log_path, "r+b") as truncate_handle:
@@ -255,7 +260,9 @@ class Store:
 
         size = len(entries)
         root = merkle.root_hash(hashes)
-        effective_end = truncate_end
+        # With a physically incomplete tail frame the durable prefix ends where
+        # that frame began; otherwise it ends after the last complete frame.
+        effective_end = truncate_end if truncated else valid_end
         self.entries = entries
         self.hashes = hashes
         self.tree_size = size

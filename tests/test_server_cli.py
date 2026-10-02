@@ -122,6 +122,47 @@ class ServiceCliTest(unittest.TestCase):
         result = audit.verify_consistency_response(3, bytes.fromhex(root_3), response)
         self.assertFalse(result["ok"])
 
+    def test_restart_append_and_restart_keep_head_and_proofs_consistent(self):
+        # Reproduces the reported sequence: the first restart looked fine, but
+        # after another append and a second restart the head no longer matched
+        # the records and the new entries could not be audited.
+        base = self.start_server()
+        self.request(
+            base, "POST", "/v1/records",
+            {"records": [{"i": i} for i in range(3)]},
+        )
+        old_head = audit.tree_head(base)
+        self.stop_server()
+
+        base = self.start_server()
+        head = audit.tree_head(base)
+        self.assertEqual(head, old_head)
+        r = self.request(
+            base, "POST", "/v1/records",
+            {"records": [{"i": 3}, {"i": 4}]},
+        )
+        self.assertEqual((r["start_index"], r["count"]), (3, 2))
+        self.stop_server()
+
+        base = self.start_server()
+        head = audit.tree_head(base)
+        self.assertEqual(head["tree_size"], 5)
+        self.assertTrue(audit.audit_root(base)["ok"])
+        for index in range(5):
+            self.assertTrue(audit.audit_inclusion(base, index)["ok"], index)
+        result = audit.audit_consistency(
+            base, old_head["tree_size"], old_head["root_hash"]
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["new_size"], 5)
+
+    def stop_server(self):
+        if self.process is not None:
+            self.process.terminate()
+            self.process.wait(timeout=10)
+            self._close_process_streams()
+            self.process = None
+
     def test_process_crash_between_durable_records_and_tree_head_publication(self):
         base = self.start_server({"VLOG_CRASH_AT": "records_fsynced"})
         with self.assertRaises((urllib.error.URLError, http.client.RemoteDisconnected)):

@@ -96,6 +96,128 @@ class StoreTest(unittest.TestCase):
             3,
         )
 
+    def test_clean_restart_then_append_survives_a_second_restart(self):
+        # The reported failure: a normal restart must remember the committed
+        # byte offset, otherwise the next append publishes a tree head whose
+        # offset splits previously committed records.
+        store = self.open_store()
+        first = [canonical.dumps_canonical({"i": i}) for i in range(3)]
+        store.append_entries(first)
+        del store
+
+        restarted = self.open_store()
+        log_size = (self.path / "log").stat().st_size
+        self.assertEqual(restarted.tree_size, 3)
+        self.assertEqual(restarted.log_bytes, log_size)
+
+        restarted.append_entries([canonical.dumps_canonical({"i": 3})])
+        del restarted
+
+        second_restart = self.open_store()
+        self.assertEqual(second_restart.tree_size, 4)
+        self.assertEqual(
+            second_restart.log_bytes, (self.path / "log").stat().st_size
+        )
+        self.assertEqual(
+            canonical.loads(second_restart.get_entry(3)), {"i": 3}
+        )
+        self.assertEqual(
+            second_restart.root,
+            merkle.root_from_entries(
+                [canonical.dumps_canonical({"i": i}) for i in range(4)]
+            ),
+        )
+
+    def test_truncated_tail_followed_by_append_then_restart(self):
+        store = self.open_store()
+        store.append_entries([canonical.dumps_canonical({"i": i}) for i in range(3)])
+        del store
+
+        log = self.path / "log"
+        log.write_bytes(
+            log.read_bytes() + b"VLOG" + (99).to_bytes(8, "big") + b"{partial"
+        )
+        recovered = self.open_store()
+        boundary = log.stat().st_size
+        recovered.append_entries([canonical.dumps_canonical({"i": 99})])
+        del recovered
+
+        again = self.open_store()
+        self.assertEqual(again.tree_size, 4)
+        self.assertEqual(again.log_bytes, log.stat().st_size)
+        self.assertEqual(canonical.loads(again.get_entry(3)), {"i": 99})
+        self.assertGreater(log.stat().st_size, boundary)
+
+    def test_committed_corruption_with_dangling_tails_is_fatal_without_side_effects(
+        self,
+    ):
+        # Complete-but-unpublished tail records and an unfinished tail frame
+        # coexist with corruption inside the published prefix.  Opening must be
+        # fatal, and neither tail truncation nor a head rewrite may happen
+        # first: every interface must keep seeing the same durable state.
+        store = self.open_store()
+        payloads = [canonical.dumps_canonical({"i": i}) for i in range(5)]
+        store.append_entries(payloads[:2])
+        store.append_entries(payloads[2:])
+        del store
+
+        log = self.path / "log"
+        original = log.read_bytes()
+        original_head = (self.path / "tree-head.json").read_bytes()
+        with open(log, "ab") as handle:
+            handle.write(storage.build_frame(canonical.dumps_canonical({"tail": 0})))
+            handle.write(storage.build_frame(canonical.dumps_canonical({"tail": 1})))
+            handle.write(b"VLOG" + (99).to_bytes(8, "big") + b"{partial")
+        dangling_size = log.stat().st_size
+
+        # Corrupt the final checksum byte of committed record 1.
+        frame_one_start = len(b"VLOG") + 8 + len(payloads[0]) + 32
+        checksum_byte = (
+            frame_one_start + len(b"VLOG") + 8 + len(payloads[1]) + 31
+        )
+        data = bytearray(log.read_bytes())
+        data[checksum_byte] ^= 0x01
+        log.write_bytes(data)
+
+        with self.assertRaises(storage.CorruptLogError):
+            self.open_store()
+        self.assertEqual(log.stat().st_size, dangling_size)
+        self.assertEqual((self.path / "tree-head.json").read_bytes(), original_head)
+        self.assertFalse((self.path / "tree-head.json.tmp").exists())
+        # The dangling tails beyond the committed prefix are untouched; nothing
+        # was truncated or silently healed.
+        tails = (
+            storage.build_frame(canonical.dumps_canonical({"tail": 0}))
+            + storage.build_frame(canonical.dumps_canonical({"tail": 1}))
+            + b"VLOG" + (99).to_bytes(8, "big") + b"{partial"
+        )
+        self.assertEqual(log.read_bytes()[len(original) :], tails)
+
+    def test_unpublished_complete_tails_plus_partial_frame_are_republished_together(
+        self,
+    ):
+        store = self.open_store()
+        payloads = [canonical.dumps_canonical({"i": i}) for i in range(5)]
+        store.append_entries(payloads)
+        del store
+
+        log = self.path / "log"
+        with open(log, "ab") as handle:
+            handle.write(storage.build_frame(canonical.dumps_canonical({"tail": 0})))
+            handle.write(storage.build_frame(canonical.dumps_canonical({"tail": 1})))
+            handle.write(b"VLOG" + (99).to_bytes(8, "big") + b"{partial")
+
+        recovered = self.open_store()
+        self.assertEqual(recovered.tree_size, 7)
+        self.assertEqual(recovered.log_bytes, log.stat().st_size)
+        self.assertEqual(
+            canonical.loads(recovered.get_entry(6)), {"tail": 1}
+        )
+        head = canonical.loads((self.path / "tree-head.json").read_bytes())
+        self.assertEqual(head["tree_size"], 7)
+        self.assertEqual(head["log_bytes"], log.stat().st_size)
+        self.assertEqual(bytes.fromhex(head["root_hash"]), recovered.root)
+
     def test_complete_middle_corruption_is_fatal_never_skipped(self):
         store = self.open_store()
         payloads = [canonical.dumps_canonical({"i": i}) for i in range(4)]
